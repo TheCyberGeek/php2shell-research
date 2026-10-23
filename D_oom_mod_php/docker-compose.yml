@@ -1,0 +1,9 @@
+name: phase_d
+
+services:
+  target:
+    build: .
+    image: phase_d
+    container_name: phase_d
+    ports:
+      - "127.0.0.1:8083:80"

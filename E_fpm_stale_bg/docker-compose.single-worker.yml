@@ -1,0 +1,10 @@
+# Study / validation override - forces ONE FPM worker so the producer and
+# consumer deterministically share it. This is NOT a vulnerability precondition:
+# a real multi-worker target is reached with slowloris saturation (see Phase D).
+# It only isolates the cross-request UAF so it is reproducible for study.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.single-worker.yml up --build -d
+services:
+  php-fpm:
+    volumes:
+      - ./conf/www-single.conf:/usr/local/etc/php-fpm.d/zz-single.conf:ro

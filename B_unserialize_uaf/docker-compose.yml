@@ -1,0 +1,12 @@
+name: phase_b
+
+services:
+  target:
+    build: .
+    image: phase_b
+    container_name: phase_b
+    ports:
+      - "127.0.0.1:8081:80"
+    # ptrace for the optional gdb walkthrough in README.md
+    cap_add: [SYS_PTRACE]
+    security_opt: ["seccomp=unconfined"]
