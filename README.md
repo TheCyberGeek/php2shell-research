@@ -14,13 +14,13 @@ Affected: PHP <= 8.4.26, and the 8.5 line <= 8.5.11. Fixed in 8.2.35, 8.3.36,
 > **Important - Read this first:**  
 > This repository and exploit codes are provided **for educational and research purposes only**. Do **not** use this code against systems, networks, or services for which you do not have **explicit, written authorization**. Unauthorized access to computer systems is illegal and unethical. By using this code you agree to follow applicable laws and institutional policies.
 
-| Phase | Folder | Technique | SAPI | Pre-auth |
-|-------|--------|-----------|------|----------|
-| A | [A_session_lfi](A_session_lfi/) | upload_progress writes PHP into the session file, included via an LFI | any | yes |
-| B | [B_unserialize_uaf](B_unserialize_uaf/) | var_destroy UAF overwrites a function handler with `zif_system` | any | no (escalation) |
-| C | [C_handler_mismatch](C_handler_mismatch/) | serialize_handler mismatch deserializes an object, `__destruct` fires | FPM | yes |
-| D | [D_oom_mod_php](D_oom_mod_php/) | OOM leaks ASLR over HTTP, fake HashTable destructor runs `system` | mod_php | yes |
-| E | [E_fpm_stale_bg](E_fpm_stale_bg/) | FPM session-decode OOM leaves a stale global, reused next request | FPM | consumer yes, producer needs a seeded session |
+| Phase | Folder                                    | Technique                                                    | SAPI    | Pre-auth                                      |
+| ----- | ----------------------------------------- | ------------------------------------------------------------ | ------- | --------------------------------------------- |
+| A     | [A_session_lfi](A_session_lfi/)           | upload_progress writes PHP into the session file, included via an LFI | any     | yes                                           |
+| B     | [B_unserialize_uaf](B_unserialize_uaf/)   | var_destroy UAF overwrites a function handler with `zif_system` | any     | no (escalation)                               |
+| C     | [C_handler_mismatch](C_handler_mismatch/) | serialize_handler mismatch deserializes an object, `__destruct` fires | FPM     | yes                                           |
+| D     | [D_oom_mod_php](D_oom_mod_php/)           | OOM leaks ASLR over HTTP, fake HashTable destructor runs `system` | mod_php | yes                                           |
+| E     | [E_fpm_stale_bg](E_fpm_stale_bg/)         | FPM session-decode OOM leaves a stale global, reused next request | FPM     | consumer yes, producer needs a seeded session |
 
 ## The two bugs
 
@@ -175,6 +175,7 @@ No application conditions. Unauthenticated RCE on stock `php:8.4.26-apache`.
 1. **Saturate:** hold `MaxRequestWorkers - 1` workers with slow chunked uploads so
    the producer and consumer hit the one free worker (the producer's OOM closes
    its connection, so the pair can't be pinned otherwise).
+
 2. **Leak:** a chunked multipart body (past `post_max_size`) sized so Zend-MM hits
    `memory_limit` at the session-cookie URL-encode:
 
@@ -188,6 +189,7 @@ No application conditions. Unauthenticated RCE on stock `php:8.4.26-apache`.
    so `Set-Cookie` returns that much heap. The dump gives the Zend-MM chunk base
    (pointers on a 2 MB boundary) and the libphp base (pointer matching
    `zval_ptr_dtor`'s page offset).
+
 3. **Fire:** the same OOM left `PS(http_session_vars)` dangling. Spray the fake
    HashTable to reoccupy it; at request end `zend_array_destroy` calls the forged
    destructor. Verified end to end, ASLR on, single worker and the default
@@ -310,11 +312,17 @@ finish.
 - 9bie,
   [github.com/9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)
   - the mod_php OOM -> Set-Cookie ASLR leak -> fake-destructor chain. A lot of the
-  memory-corruption research behind phase D draws on this repo.
+    memory-corruption research behind phase D draws on this repo. Phase D's **default
+    fast chain** (`engine.Fast`) is a native port of 9bie's amplification technique:
+    the nested empty-filename `$_FILES` OOM arm (~320x heap-per-wire, so no 128 MB
+    stream and a non-corrupting bailout) and the double-sided fake-`zend_reference`
+    fire onto a fake `zend_array` at `chunk + FAST_S_OFFSET`. Our build-specific
+    offset (`0xF5398`) and the one-leak/arm+fire orchestration are ours; the
+    primitive is 9bie's.
 - dinosn (Nicolas Krassas),
   [github.com/dinosn/php-cve-2026-10961x-lab-poc](https://github.com/dinosn/php-cve-2026-10961x-lab-poc)
   - phase D's driver (`engine.py` / `php2shell.py`), including the worker-pool
-  saturation.
+    saturation.
 - ikow (Qi Deng),
   [github.com/ikow/php2shell-poc](https://github.com/ikow/php2shell-poc)
   - phases A, B and C.
